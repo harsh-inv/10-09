@@ -309,26 +309,6 @@ async def download_failed_values_csv(session_id: str):
         
         if not failing_records:
             raise HTTPException(status_code=404, detail="No failing values found.")
-        
-        # Convert to CSV
-        df = pd.DataFrame(failing_records)
-        csv_filename = f"failing_values_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        csv_path = os.path.join(session['temp_dir'], csv_filename)
-        df.to_csv(csv_path, index=False)
-        
-        return FileResponse(
-            csv_path,
-            media_type='text/csv',
-            filename=csv_filename,
-            headers={"Content-Disposition": f"attachment; filename={csv_filename}"}
-        )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error creating failing values CSV: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error creating failing values CSV: {str(e)}")
-
 # ==================== POST ENDPOINTS ====================
 
 @app.post("/session/create", response_model=SessionResponse)
@@ -639,5 +619,6 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
 
 
