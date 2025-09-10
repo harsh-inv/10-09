@@ -9,7 +9,6 @@ import tempfile
 import sqlite3
 import json
 from datetime import datetime
-import pandas as pd
 import io
 import asyncio
 import logging
@@ -625,3 +624,4 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
