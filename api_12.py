@@ -223,32 +223,47 @@ async def get_check_results(session_id: str):
         logger.error(f"Error getting results: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting results: {str(e)}")
 
-@app.get("/files/download/results-csv/{session_id}")
-async def download_results_csv(session_id: str):
-    """GET: Download check results as CSV file"""
+@app.get("/files/download/failed-values-csv/{session_id}")
+async def download_failed_values_csv(session_id: str):
+    """GET: Download detailed failing values as CSV"""
     try:
         session = session_manager.get_session(session_id)
         
-        if not session['results']:
+        if not session['results'] or not session['checker']:
             raise HTTPException(status_code=404, detail="No results available. Run checks first.")
         
-        # Create CSV content
-        csv_rows = []
-        csv_rows.append("table,field,check_type,status,message,timestamp")
-        
-        timestamp = datetime.now().isoformat()
+        # Create detailed failing values data - NO PANDAS
+        failing_records = []
         for table_name, table_results in session['results'].items():
             for result in table_results:
-                message = result['message'].replace('"', '""')
-                row = f'"{result["table"]}","{result["field"]}","{result["check_type"]}","{result["status"]}","{message}","{timestamp}"'
-                csv_rows.append(row)
+                if result['status'] in ['FAIL', 'ERROR']:
+                    failing_values = session['checker']._get_failing_values_from_db(
+                        table_name, result['field'], result['check_type']
+                    )
+                    
+                    for failing_value in failing_values:
+                        failing_records.append([
+                            table_name,
+                            result['field'],
+                            result['check_type'],
+                            str(failing_value),
+                            result['status'],
+                            result['message'],
+                            datetime.now().isoformat()
+                        ])
         
-        # Save to temporary file
-        csv_filename = f"data_quality_results_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        if not failing_records:
+            raise HTTPException(status_code=404, detail="No failing values found.")
+        
+        # Create CSV manually - NO PANDAS
+        import csv
+        csv_filename = f"failing_values_{session_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         csv_path = os.path.join(session['temp_dir'], csv_filename)
         
-        with open(csv_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(csv_rows))
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(['table', 'field_name', 'check_type', 'failing_value', 'status', 'message', 'timestamp'])
+            writer.writerows(failing_records)
         
         return FileResponse(
             csv_path,
@@ -260,8 +275,8 @@ async def download_results_csv(session_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error creating CSV: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error creating CSV: {str(e)}")
+        logger.error(f"Error creating failing values CSV: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error creating failing values CSV: {str(e)}")
 
 @app.get("/files/download/failed-values-csv/{session_id}")
 async def download_failed_values_csv(session_id: str):
@@ -624,4 +639,5 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
+
 
