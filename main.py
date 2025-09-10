@@ -1,6 +1,6 @@
 # main.py - Complete FastAPI Web API for Data Quality Checker
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
@@ -10,18 +10,12 @@ import tempfile
 import sqlite3
 import csv
 import json
+import re
 from datetime import datetime
 import logging
 import sys
 import shutil
 import io
-
-# Import your existing classes from org_1_2907.py
-try:
-    from org_1_2907 import DataQualityChecker, ResultsManager, DataMaskingManager
-except ImportError:
-    print("Warning: Could not import from org_1_2907.py - using fallback classes")
-    # Fallback classes would go here if needed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,13 +33,425 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models for request/response
+# ============================================================================
+# CLASSES FROM org_1_2907.py - INTEGRATED DIRECTLY
+# ============================================================================
+
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+class DataMaskingManager:
+    def __init__(self):
+        self.table_mapping = {}
+        self.column_mapping = {}
+        self.reverse_table_mapping = {}
+        self.reverse_column_mapping = {}
+
+    def mask_table_name(self, original_name: str) -> str:
+        if original_name not in self.table_mapping:
+            masked_name = f"table_{len(self.table_mapping) + 1}"
+            self.table_mapping[original_name] = masked_name
+            self.reverse_table_mapping[masked_name] = original_name
+        return self.table_mapping[original_name]
+
+class DataQualityChecker:
+    def __init__(self, db_connection):
+        self.db_connection = db_connection
+        self.checks_config = {}
+        self.system_codes_config = {}
+
+    def load_checks_config(self, csv_file_path: str) -> bool:
+        try:
+            with open(csv_file_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    table_name = row['table_name'].strip()
+                    field_name = row['field_name'].strip()
+                    
+                    if table_name not in self.checks_config:
+                        self.checks_config[table_name] = {}
+                    
+                    self.checks_config[table_name][field_name] = {
+                        'description': row['description'],
+                        'special_characters_check': row['special_characters_check'] == '1',
+                        'null_check': row['null_check'] == '1',
+                        'blank_check': row['blank_check'] == '1',
+                        'max_value_check': row['max_value_check'] == '1',
+                        'min_value_check': row['min_value_check'] == '1',
+                        'max_count_check': row['max_count_check'] == '1',
+                        'email_check': row['email_check'] == '1',
+                        'numeric_check': row['numeric_check'] == '1',
+                        'system_codes_check': row['system_codes_check'] == '1',
+                        'language_check': row['language_check'] == '1',
+                        'phone_number_check': row['phone_number_check'] == '1',
+                        'duplicate_check': row['duplicate_check'] == '1',
+                        'date_check': row['date_check'] == '1'
+                    }
+            return True
+        except Exception as e:
+            logger.error(f"Error loading checks configuration: {str(e)}")
+            return False
+
+    def load_system_codes_config(self, csv_file_path: str) -> bool:
+        try:
+            self.system_codes_config = {}
+            with open(csv_file_path, 'r', encoding='utf-8') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    table_name = row['table_name'].strip()
+                    field_name = row['field_name'].strip()
+                    valid_codes_str = row['valid_codes']
+                    
+                    valid_codes = [code.strip() for code in valid_codes_str.split(',') if code.strip()]
+                    
+                    if table_name not in self.system_codes_config:
+                        self.system_codes_config[table_name] = {}
+                    
+                    self.system_codes_config[table_name][field_name] = valid_codes
+            return True
+        except Exception as e:
+            logger.error(f"Error loading system codes configuration: {str(e)}")
+            return False
+
+    def _table_exists(self, table_name: str) -> bool:
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+            return cursor.fetchone() is not None
+        except sqlite3.Error:
+            return False
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            return column_name in columns
+        except sqlite3.Error:
+            return False
+
+    def _is_numeric(self, value: str) -> bool:
+        try:
+            float(value)
+            return True
+        except ValueError:
+            return False
+
+    def _is_valid_email(self, email: str) -> bool:
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(email_pattern, email) is not None
+
+    def _is_valid_phone(self, phone: str) -> bool:
+        cleaned_phone = re.sub(r'[^\d+]', '', phone)
+        if len(cleaned_phone) < 10 or len(cleaned_phone) > 15:
+            return False
+        phone_pattern = r'^\+?[1-9]\d{9,14}$'
+        return re.match(phone_pattern, cleaned_phone) is not None
+
+    def _is_valid_date(self, date_str: str) -> bool:
+        date_formats = [
+            '%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y-%m-%d %H:%M:%S',
+            '%m-%d-%Y', '%d-%m-%Y', '%Y/%m/%d', '%d.%m.%Y',
+            '%Y', '%m/%Y', '%Y-%m'
+        ]
+        for fmt in date_formats:
+            try:
+                datetime.strptime(str(date_str), fmt)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _has_special_characters(self, text: str) -> bool:
+        allowed_pattern = r'^[a-zA-Z0-9\s.,@_-]+$'
+        return not re.match(allowed_pattern, text)
+
+    def _has_non_ascii_characters(self, text: str) -> bool:
+        try:
+            text.encode('ascii')
+            return False
+        except UnicodeEncodeError:
+            return True
+
+    def _get_valid_system_codes(self, table_name: str, field_name: str) -> List[str]:
+        return self.system_codes_config.get(table_name, {}).get(field_name, [])
+
+    def _run_field_checks(self, table_name: str, field_name: str, checks: Dict) -> List[Dict]:
+        results = []
+        
+        if not self._column_exists(table_name, field_name):
+            results.append({
+                'table': table_name,
+                'field': field_name,
+                'check_type': 'column_existence',
+                'status': 'FAIL',
+                'message': f"Column '{field_name}' does not exist in table '{table_name}'"
+            })
+            return results
+
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM [{table_name}]")
+            total_rows = cursor.fetchone()[0]
+
+            if total_rows == 0:
+                results.append({
+                    'table': table_name,
+                    'field': field_name,
+                    'check_type': 'data_existence',
+                    'status': 'WARNING',
+                    'message': f"Table '{table_name}' has no data"
+                })
+                return results
+
+            # Null check
+            if checks.get('null_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM [{table_name}] WHERE [{field_name}] IS NULL")
+                null_count = cursor.fetchone()[0]
+                
+                if null_count > 0:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'null_check',
+                        'status': 'FAIL',
+                        'message': f"Found {null_count} NULL values out of {total_rows} total rows"
+                    })
+                else:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'null_check',
+                        'status': 'PASS',
+                        'message': f"No NULL values found"
+                    })
+
+            # Blank check
+            if checks.get('blank_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM [{table_name}] WHERE [{field_name}] = ''")
+                blank_count = cursor.fetchone()[0]
+                
+                if blank_count > 0:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'blank_check',
+                        'status': 'FAIL',
+                        'message': f"Found {blank_count} blank values out of {total_rows} total rows"
+                    })
+                else:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'blank_check',
+                        'status': 'PASS',
+                        'message': f"No blank values found"
+                    })
+
+            # Email check
+            if checks.get('email_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM [{table_name}] WHERE [{field_name}] IS NOT NULL AND [{field_name}] != ''")
+                non_null_count = cursor.fetchone()[0]
+                
+                if non_null_count > 0:
+                    cursor.execute(f"SELECT [{field_name}] FROM [{table_name}] WHERE [{field_name}] IS NOT NULL AND [{field_name}] != '' LIMIT 100")
+                    values = cursor.fetchall()
+                    invalid_emails = []
+                    
+                    for value in values:
+                        email = str(value[0]).strip()
+                        if not self._is_valid_email(email):
+                            invalid_emails.append(email)
+                    
+                    if invalid_emails:
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'email_check',
+                            'status': 'FAIL',
+                            'message': f"Found {len(invalid_emails)} invalid email formats out of {non_null_count} values"
+                        })
+                    else:
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'email_check',
+                            'status': 'PASS',
+                            'message': f"All {non_null_count} email formats appear valid"
+                        })
+
+            # System codes check
+            if checks.get('system_codes_check', False):
+                cursor.execute(f"SELECT COUNT(*) FROM [{table_name}] WHERE [{field_name}] IS NOT NULL AND [{field_name}] != ''")
+                non_null_count = cursor.fetchone()[0]
+                
+                if non_null_count > 0:
+                    cursor.execute(f"SELECT DISTINCT [{field_name}] FROM [{table_name}] WHERE [{field_name}] IS NOT NULL AND [{field_name}] != '' LIMIT 100")
+                    values = cursor.fetchall()
+                    
+                    valid_codes_list = self._get_valid_system_codes(table_name, field_name)
+                    invalid_system_codes = []
+                    
+                    for value in values:
+                        code = str(value[0]).strip().upper()
+                        valid_codes_upper = [vc.upper() for vc in valid_codes_list] if valid_codes_list else []
+                        
+                        if valid_codes_list and code not in valid_codes_upper:
+                            invalid_system_codes.append(str(value[0]).strip())
+                    
+                    if invalid_system_codes:
+                        message = f"Found {len(invalid_system_codes)} invalid system codes out of {non_null_count} values"
+                        if valid_codes_list:
+                            message += f" (Valid codes: {len(valid_codes_list)} defined)"
+                        
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'system_codes_check',
+                            'status': 'FAIL',
+                            'message': message
+                        })
+                    else:
+                        results.append({
+                            'table': table_name,
+                            'field': field_name,
+                            'check_type': 'system_codes_check',
+                            'status': 'PASS',
+                            'message': f"All {non_null_count} values are valid system codes"
+                        })
+
+            # Duplicate check
+            if checks.get('duplicate_check', False):
+                cursor.execute(f"""
+                    SELECT [{field_name}], COUNT(*) as count
+                    FROM [{table_name}]
+                    WHERE [{field_name}] IS NOT NULL
+                    GROUP BY [{field_name}]
+                    HAVING COUNT(*) > 1
+                    ORDER BY count DESC
+                """)
+                duplicates = cursor.fetchall()
+                
+                if duplicates:
+                    total_duplicate_count = sum(count - 1 for _, count in duplicates)
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'duplicate_check',
+                        'status': 'FAIL',
+                        'message': f"Found {total_duplicate_count} duplicate values across {len(duplicates)} distinct values"
+                    })
+                else:
+                    results.append({
+                        'table': table_name,
+                        'field': field_name,
+                        'check_type': 'duplicate_check',
+                        'status': 'PASS',
+                        'message': f"No duplicate values found"
+                    })
+
+        except sqlite3.Error as e:
+            results.append({
+                'table': table_name,
+                'field': field_name,
+                'check_type': 'database_error',
+                'status': 'ERROR',
+                'message': f"Database error: {str(e)}"
+            })
+
+        return results
+
+    def run_all_checks(self) -> Dict[str, List[Dict]]:
+        if not self.checks_config:
+            return {}
+
+        results = {}
+        for table_name, fields in self.checks_config.items():
+            if not self._table_exists(table_name):
+                continue
+                
+            table_results = []
+            for field_name, checks in fields.items():
+                field_results = self._run_field_checks(table_name, field_name, checks)
+                if field_results:
+                    table_results.extend(field_results)
+            
+            if table_results:
+                results[table_name] = table_results
+
+        return results
+
+    def run_checks_for_specific_table(self, table_name: str) -> Dict[str, List[Dict]]:
+        if table_name not in self.checks_config:
+            return {}
+        
+        if not self._table_exists(table_name):
+            return {}
+
+        table_results = []
+        fields = self.checks_config[table_name]
+        
+        for field_name, checks in fields.items():
+            field_results = self._run_field_checks(table_name, field_name, checks)
+            if field_results:
+                table_results.extend(field_results)
+
+        if table_results:
+            return {table_name: table_results}
+        else:
+            return {}
+
+class ResultsManager:
+    def __init__(self):
+        self.results_db_path = "Results.db"
+        self.results_connection = None
+        self._initialize_results_db()
+
+    def _initialize_results_db(self):
+        try:
+            self.results_connection = sqlite3.connect(self.results_db_path)
+            cursor = self.results_connection.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS query_metadata (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    table_name TEXT NOT NULL,
+                    execution_date TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    original_query TEXT NOT NULL,
+                    row_count INTEGER,
+                    column_count INTEGER,
+                    description TEXT,
+                    created_timestamp TEXT NOT NULL,
+                    UNIQUE(table_name, version)
+                )
+            ''')
+            self.results_connection.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error initializing Results database: {str(e)}")
+
+    def close(self):
+        if self.results_connection:
+            self.results_connection.close()
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
+
 class SessionResponse(BaseModel):
     session_id: str
     message: str
@@ -71,7 +477,10 @@ class SessionStatus(BaseModel):
     system_codes_loaded: bool
     last_check_results: Optional[Dict[str, Any]] = None
 
-# Session Manager
+# ============================================================================
+# SESSION MANAGER
+# ============================================================================
+
 class SessionManager:
     def __init__(self):
         self.sessions = {}
@@ -101,12 +510,10 @@ class SessionManager:
     def cleanup_session(self, session_id: str):
         if session_id in self.sessions:
             session = self.sessions[session_id]
-            # Close database connections
             if session.get('db_connection'):
                 session['db_connection'].close()
             if session.get('results_manager'):
                 session['results_manager'].close()
-            # Clean up temporary files
             if session.get('temp_dir') and os.path.exists(session['temp_dir']):
                 shutil.rmtree(session['temp_dir'], ignore_errors=True)
             del self.sessions[session_id]
@@ -114,16 +521,17 @@ class SessionManager:
 
 session_manager = SessionManager()
 
-# Helper Functions
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def save_uploaded_file(upload_file: UploadFile, session_dir: str, file_type: str) -> str:
-    """Save uploaded file to session directory"""
     file_path = os.path.join(session_dir, f"{file_type}_{upload_file.filename}")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(upload_file.file, buffer)
     return file_path
 
 def validate_csv_structure(file_path: str, expected_columns: List[str]) -> bool:
-    """Validate CSV file has expected columns"""
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
             reader = csv.DictReader(file)
@@ -135,7 +543,6 @@ def validate_csv_structure(file_path: str, expected_columns: List[str]) -> bool:
         return False
 
 def get_database_tables(db_path: str) -> List[str]:
-    """Get list of tables in SQLite database"""
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -147,7 +554,9 @@ def get_database_tables(db_path: str) -> List[str]:
         logger.error(f"Error getting database tables: {str(e)}")
         return []
 
-# API Endpoints
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
 @app.get("/")
 async def root():
@@ -173,7 +582,6 @@ async def health_check():
 
 @app.post("/sessions/create", response_model=SessionResponse)
 async def create_session():
-    """Create a new session for data quality checking"""
     session_id = session_manager.create_session()
     return SessionResponse(
         session_id=session_id,
@@ -183,7 +591,6 @@ async def create_session():
 
 @app.get("/sessions/{session_id}/status", response_model=SessionStatus)
 async def get_session_status(session_id: str):
-    """Get current status of a session"""
     session = session_manager.get_session(session_id)
     
     return SessionStatus(
@@ -197,27 +604,21 @@ async def get_session_status(session_id: str):
 
 @app.post("/sessions/{session_id}/upload/database")
 async def upload_database(session_id: str, database: UploadFile = File(...)):
-    """Upload Northwind SQLite database file"""
     session = session_manager.get_session(session_id)
     
-    # Validate file type
     if not database.filename.lower().endswith(('.db', '.sqlite', '.sqlite3')):
         raise HTTPException(status_code=400, detail="Database file must be .db, .sqlite, or .sqlite3")
     
     try:
-        # Save uploaded file
         db_path = save_uploaded_file(database, session['temp_dir'], "database")
-        
-        # Test database connection and get table info
         tables = get_database_tables(db_path)
+        
         if not tables:
             raise HTTPException(status_code=400, detail="Invalid database file or no tables found")
         
-        # Connect to database
         connection = sqlite3.connect(db_path)
         connection.row_factory = sqlite3.Row
         
-        # Update session
         session['northwind_db_path'] = db_path
         session['db_connection'] = connection
         session['checker'] = DataQualityChecker(connection)
@@ -235,7 +636,7 @@ async def upload_database(session_id: str, database: UploadFile = File(...)):
             "message": "Database uploaded and connected successfully",
             "filename": database.filename,
             "tables_found": len(tables),
-            "table_names": tables[:10],  # Show first 10 tables
+            "table_names": tables[:10],
             "status": "success"
         }
         
@@ -249,25 +650,21 @@ async def upload_config(
     data_quality_config: UploadFile = File(...),
     system_codes_config: Optional[UploadFile] = File(None)
 ):
-    """Upload data quality configuration files"""
     session = session_manager.get_session(session_id)
     
     if not session.get('checker'):
         raise HTTPException(status_code=400, detail="Database must be uploaded first")
     
     try:
-        # Process data quality config
         if not data_quality_config.filename.lower().endswith('.csv'):
             raise HTTPException(status_code=400, detail="Data quality config must be a CSV file")
         
         config_path = save_uploaded_file(data_quality_config, session['temp_dir'], "data_quality_config")
         
-        # Validate CSV structure
         expected_columns = ['table_name', 'field_name', 'description', 'null_check', 'blank_check']
         if not validate_csv_structure(config_path, expected_columns):
             raise HTTPException(status_code=400, detail="Invalid data quality config CSV structure")
         
-        # Load configuration
         success = session['checker'].load_checks_config(config_path)
         if not success:
             raise HTTPException(status_code=400, detail="Failed to load data quality configuration")
@@ -287,19 +684,16 @@ async def upload_config(
             "status": "success"
         }
         
-        # Process system codes config if provided
         if system_codes_config:
             if not system_codes_config.filename.lower().endswith('.csv'):
                 raise HTTPException(status_code=400, detail="System codes config must be a CSV file")
             
             system_codes_path = save_uploaded_file(system_codes_config, session['temp_dir'], "system_codes_config")
             
-            # Validate CSV structure
             system_codes_columns = ['table_name', 'field_name', 'valid_codes']
             if not validate_csv_structure(system_codes_path, system_codes_columns):
                 raise HTTPException(status_code=400, detail="Invalid system codes config CSV structure")
             
-            # Load system codes configuration
             success = session['checker'].load_system_codes_config(system_codes_path)
             if success:
                 session['system_codes_config_path'] = system_codes_path
@@ -325,7 +719,6 @@ async def upload_config(
 
 @app.post("/sessions/{session_id}/run-checks", response_model=CheckResults)
 async def run_data_quality_checks(session_id: str, specific_table: Optional[str] = None):
-    """Run data quality checks on uploaded database"""
     session = session_manager.get_session(session_id)
     
     if not session.get('checker'):
@@ -335,13 +728,11 @@ async def run_data_quality_checks(session_id: str, specific_table: Optional[str]
         raise HTTPException(status_code=400, detail="Data quality configuration not loaded")
     
     try:
-        # Run checks
         if specific_table:
             results = session['checker'].run_checks_for_specific_table(specific_table)
         else:
             results = session['checker'].run_all_checks()
         
-        # Calculate summary statistics
         summary = {"total": 0, "passed": 0, "failed": 0, "warnings": 0}
         
         for table_results in results.values():
@@ -355,7 +746,6 @@ async def run_data_quality_checks(session_id: str, specific_table: Optional[str]
                 elif status == "WARNING":
                     summary["warnings"] += 1
         
-        # Store results in session
         session['results'] = results
         
         logger.info(f"Data quality checks completed for session {session_id}")
@@ -373,7 +763,6 @@ async def run_data_quality_checks(session_id: str, specific_table: Optional[str]
 
 @app.get("/sessions/{session_id}/results")
 async def get_results(session_id: str):
-    """Get the last run results for a session"""
     session = session_manager.get_session(session_id)
     
     if not session.get('results'):
@@ -387,7 +776,6 @@ async def get_results(session_id: str):
 
 @app.get("/sessions/{session_id}/export/{format}")
 async def export_results(session_id: str, format: str, check_type: str = "all"):
-    """Export results in different formats"""
     session = session_manager.get_session(session_id)
     
     if not session.get('results'):
@@ -402,7 +790,6 @@ async def export_results(session_id: str, format: str, check_type: str = "all"):
     try:
         results = session['results']
         
-        # Filter results based on check_type
         filtered_results = {}
         for table_name, table_results in results.items():
             if check_type.lower() == 'failed':
@@ -418,7 +805,6 @@ async def export_results(session_id: str, format: str, check_type: str = "all"):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         if format.lower() == 'csv':
-            # Create CSV export
             filename = f"data_quality_results_{check_type}_{timestamp}.csv"
             file_path = os.path.join(session['temp_dir'], filename)
             
@@ -444,7 +830,7 @@ async def export_results(session_id: str, format: str, check_type: str = "all"):
                 media_type='text/csv'
             )
         
-        else:  # JSON format
+        else:
             filename = f"data_quality_results_{check_type}_{timestamp}.json"
             export_data = {
                 "session_id": session_id,
@@ -464,7 +850,6 @@ async def export_results(session_id: str, format: str, check_type: str = "all"):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """Delete a session and clean up resources"""
     try:
         session_manager.cleanup_session(session_id)
         return {"message": f"Session {session_id} deleted successfully"}
@@ -476,7 +861,6 @@ async def delete_session(session_id: str):
 
 @app.get("/sessions")
 async def list_sessions():
-    """List all active sessions"""
     sessions_info = []
     for session_id, session_data in session_manager.sessions.items():
         sessions_info.append({
@@ -492,7 +876,10 @@ async def list_sessions():
         "sessions": sessions_info
     }
 
-# Error handlers
+# ============================================================================
+# ERROR HANDLERS & STARTUP/SHUTDOWN
+# ============================================================================
+
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
     return JSONResponse(
@@ -507,7 +894,6 @@ async def internal_error_handler(request, exc):
         content={"message": "Internal server error", "status": "error"}
     )
 
-# Startup and shutdown events
 @app.on_event("startup")
 async def startup_event():
     logger.info("Data Quality Checker API starting up...")
@@ -515,11 +901,13 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Data Quality Checker API shutting down...")
-    # Clean up all sessions
     for session_id in list(session_manager.sessions.keys()):
         session_manager.cleanup_session(session_id)
 
-# Run the app
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
